@@ -32,6 +32,11 @@ export const options = {
 		{ duration: "40s", target: 0 }, // hạ nhiệt
 	],
 
+	// add global tags so Grafana dashboard filters (e.g., Test ID) can match
+	tags: {
+		testid: __ENV.TEST_ID || "local-dev",
+	},
+
   // sample 3 minute
   // scenarios: {
   //   main: {
@@ -105,283 +110,212 @@ function pick(arr) {
 	return arr[(Math.random() * arr.length) | 0];
 }
 
+// ===== Helpers =====
+function logFail(label, res, url, slice = 200) {
+  console.log(`[${label} FAIL] status=${res.status} url=${url}`);
+  console.log(`[${label} body] ${String(res.body || "").slice(0, slice)}`);
+}
+
+function checkTagged(target, checks, tags) {
+  return check(target, checks, tags);
+}
+
+// ===== 1) Home =====
+export function hitHome() {
+  const res = http.get(URL_BASE, { timeout: "60s", tags: { endpoint: "home_page" } });
+  if (res.status !== 200) logFail("Home", res, URL_BASE);
+  checkTagged(
+    res,
+    { "Home 200": r => r.status === 200, "Home body not empty": r => (r.body || "").length > 0 },
+    { endpoint: "home_page" }
+  );
+  sleep(1);
+}
+
+// ===== 2) Shop All =====
+export function hitShopAll() {
+  const res = http.get(SHOP_ALL_URL, { timeout: "60s", tags: { endpoint: "shop_all" } });
+  if (res.status !== 200) logFail("ShopAll", res, SHOP_ALL_URL);
+  checkTagged(
+    res,
+    { "ShopAll 200": r => r.status === 200, "ShopAll body not empty": r => (r.body || "").length > 0 },
+    { endpoint: "shop_all" }
+  );
+  sleep(1);
+}
+
+// ===== 3) PDP =====
+export function hitPDP() {
+  const res = http.get(PRODUCT_URL, { timeout: "60s", tags: { endpoint: "PDP" } });
+  if (res.status !== 200) logFail("PDP", res, PRODUCT_URL);
+  checkTagged(
+    res,
+    { "PDP 200": r => r.status === 200, "PDP body not empty": r => (r.body || "").length > 0 },
+    { endpoint: "PDP" }
+  );
+  sleep(1);
+}
+
+// ===== 4) Add to Cart =====
+export function addToCart() {
+  const p = pick(PRODUCTS);
+  const HEADERS_ATC = {
+    Accept: "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    Origin: BASE,
+    Referer: p.referer,
+    "User-Agent": "k6-avotree-loadtest/1.0",
+    "X-Test-Run": "avotree-loadtest",
+  };
+
+  const body = [
+    `action=woocommerce_ajax_add_to_cart`,
+    `product_id=${encodeURIComponent(p.pid)}`,
+    `variation_id=${encodeURIComponent(p.vid)}`,
+    `quantity=${encodeURIComponent(p.qty)}`,
+    `custom_box_price=${encodeURIComponent(p.custom_box_price)}`,
+    `attributes%5Battribute_pa_optional-product%5D=${encodeURIComponent(p.attr)}`,
+    `memberships%5Bpa_frequency%5D=`,
+    `memberships%5Bpa_dispatch-day%5D=`,
+    `memberships%5Bstart_subcription%5D=`,
+  ].join("&");
+
+  const res = http.post(`${BASE}/wp-admin/admin-ajax.php`, body, {
+    headers: HEADERS_ATC,
+    timeout: "60s",
+    tags: { endpoint: "add_to_cart" },
+  });
+
+  let ok = res.status && res.status < 400;
+  try {
+    const j = res.json();
+    ok = ok && (j?.error === false || j?.fragments || j?.success === true);
+  } catch (_) { /* ignore parse error */ }
+
+  if (!ok) logFail("ATC", res, `${BASE}/wp-admin/admin-ajax.php`, 300);
+
+  checkTagged(res, { "Add to Cart": () => ok }, { endpoint: "add_to_cart" });
+  sleep(1);
+}
+
+// ===== 5) Checkout (3 bước) =====
+export function runCheckout() {
+  const HEADERS_FORM = {
+    Accept: "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    Origin: BASE,
+    Referer: `${BASE}/checkout/`,
+    "User-Agent": "k6-avotree-loadtest/1.0",
+    "X-Test-Run": "avotree-loadtest",
+  };
+
+  // 5.1 GET checkout page
+  const page = http.get(`${BASE}/checkout/`, { timeout: "60s", tags: { endpoint: "checkout_page" } });
+  checkTagged(page, { "Checkout page OK": r => r.status && r.status < 400 }, { endpoint: "checkout_page" });
+
+  const $ = parseHTML(page.body);
+  let checkoutNonce =
+    $.find('input[name="woocommerce-process-checkout-nonce"]').first().attr("value") ||
+    $.find('input[name="_wpnonce"]').first().attr("value") || "";
+
+  let uorNonce = "";
+  {
+    const m = page.body.match(/update_order_review_nonce["']\s*:\s*["']([^"']+)["']/) ||
+              page.body.match(/"update_order_review_nonce":"([a-zA-Z0-9]+)"/);
+    if (m) uorNonce = m[1];
+  }
+
+  checkTagged(
+    { checkoutNonce, uorNonce },
+    {
+      "Checkout nonce found": v => v.checkoutNonce && v.checkoutNonce.length > 0,
+      "UOR nonce found": v => v.uorNonce && v.uorNonce.length > 0,
+    },
+    { endpoint: "checkout_page" }
+  );
+
+  // 5.2 POST update_order_review
+  const email = `loadtest+${__VU}-${__ITER}@example.com`;
+  const postDataPairs = [
+    "wc-points-rewards-max-points=0",
+    "billing_first_name=Test",
+    "billing_last_name=User",
+    `billing_email=${encodeURIComponent(email)}`,
+    "billing_phone=0210000000",
+    "billing_country=NZ",
+    "billing_address_1=1 Test St",
+    "billing_city=Auckland",
+    "billing_postcode=1010",
+    "payment_method=cod",
+  ];
+  const post_data = postDataPairs.join("&");
+
+  const uorBody = [
+    `security=${encodeURIComponent(uorNonce)}`,
+    `payment_method=cod`,
+    `country=NZ`,
+    `state=`,
+    `postcode=1010`,
+    `city=Auckland`,
+    `address=${encodeURIComponent("1 Test St")}`,
+    `address_2=`,
+    `s_country=NZ`,
+    `s_state=`,
+    `s_postcode=`,
+    `s_city=Auckland`,
+    `s_address=`,
+    `s_address_2=`,
+    `has_full_address=true`,
+    `post_data=${post_data}`,
+  ].join("&");
+
+  const uor = http.post(`${BASE}/?wc-ajax=update_order_review`, uorBody, {
+    headers: HEADERS_FORM,
+    timeout: "60s",
+    tags: { endpoint: "update_order_review" },
+  });
+  checkTagged(uor, { "UOR 200": r => r.status >= 200 && r.status < 400 }, { endpoint: "update_order_review" });
+
+  // 5.3 POST checkout finish
+  const form = [
+    `billing_first_name=Test`,
+    `billing_last_name=User`,
+    `billing_email=${encodeURIComponent(email)}`,
+    `billing_phone=0210000000`,
+    `billing_address_1=1 Test St`,
+    `billing_city=Auckland`,
+    `billing_postcode=1010`,
+    `billing_country=NZ`,
+    `payment_method=cod`,
+    `terms=on`,
+    `woocommerce-process-checkout-nonce=${encodeURIComponent(checkoutNonce)}`,
+    `_wp_http_referer=%2F%3Fwc-ajax%3Dupdate_order_review`,
+  ].join("&");
+
+  const co = http.post(`${BASE}/?wc-ajax=checkout`, form, {
+    headers: HEADERS_FORM,
+    timeout: "60s",
+    tags: { endpoint: "checkout_finish" },
+  });
+
+  const coOk = co.status && co.status < 400;
+
+  if (!coOk) logFail("Checkout", co, `${BASE}/?wc-ajax=checkout`, 300);
+  checkTagged(co, { "Checkout OK": () => coOk }, { endpoint: "checkout_finish" });
+
+  sleep(1);
+}
+
+// ===== default =====
 export default function () {
-	// 1) Home Page
-	group("Home Page", () => {
-		const res = http.get(URL_BASE, {
-			timeout: "60s",
-			tags: { endpoint: "home_page" }, // endpoint = home_page
-		});
-
-		check(
-			res,
-			{
-				"Home Page status 200": (r) => r.status === 200,
-				"Home Page body not empty": (r) => (r.body || "").length > 0,
-			},
-			{ endpoint: "home_page" } // gắn tag cho checks
-		);
-
-		if (res.status !== 200) {
-			console.log(`[Home FAIL] status=${res.status} url=${URL_BASE}`);
-			console.log(
-				`[Home body snippet] ${String(res.body || "").slice(0, 200)}`
-			);
-		}
-
-		sleep(1);
-	});
-	// 2) Shop All Page
-	group("Shop All Page", () => {
-		const res = http.get(SHOP_ALL_URL, {
-			timeout: "60s",
-			tags: { endpoint: "shop_all" },
-		});
-
-		check(
-			res,
-			{
-				"Shop All status 200": (r) => r.status === 200,
-				"Shop All body not empty": (r) => (r.body || "").length > 0,
-			},
-			{ endpoint: "shop_all" } // gắn tag cho checks
-		);
-
-		if (res.status !== 200) {
-			console.log(
-				`[Shop All FAIL] status=${res.status} url=${SHOP_ALL_URL}`
-			);
-			console.log(
-				`[Shop All body snippet] ${String(res.body || "").slice(
-					0,
-					200
-				)}`
-			);
-		}
-
-		sleep(1);
-	});
-
-	// 3) PDP
-	group("Product Detail Page", () => {
-		const res = http.get(PRODUCT_URL, {
-			timeout: "60s",
-			tags: { endpoint: "PDP" },
-		});
-
-		if (res.status !== 200) {
-			console.log(`[PDP FAIL] status=${res.status} url=${PRODUCT_URL}`);
-			console.log(
-				`[PDP body snippet] ${String(res.body || "").slice(0, 200)}`
-			);
-		}
-
-		check(
-			res,
-			{
-				"PDP status 200": (r) => r.status === 200,
-				"PDP body not empty": (r) => (r.body || "").length > 0,
-			},
-			{ endpoint: "PDP" } // gắn tag cho check
-		);
-		sleep(1);
-	});
-
-	// Add to Cart
-	group("Add To Cart", () => {
-		const p = pick(PRODUCTS);
-		const HEADERS_ATC = {
-			Accept: "application/json, text/javascript, */*; q=0.01",
-			"Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-			"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-			"X-Requested-With": "XMLHttpRequest",
-			Origin: BASE,
-			Referer: p.referer,
-			"User-Agent": "k6-avotree-loadtest/1.0",
-			"X-Test-Run": "avotree-loadtest",
-		};
-		const body = [
-			`action=woocommerce_ajax_add_to_cart`,
-			`product_id=${encodeURIComponent(p.pid)}`,
-			`variation_id=${encodeURIComponent(p.vid)}`,
-			`quantity=${encodeURIComponent(p.qty)}`,
-			`custom_box_price=${encodeURIComponent(p.custom_box_price)}`,
-			`attributes%5Battribute_pa_optional-product%5D=${encodeURIComponent(
-				p.attr
-			)}`,
-			`memberships%5Bpa_frequency%5D=`,
-			`memberships%5Bpa_dispatch-day%5D=`,
-			`memberships%5Bstart_subcription%5D=`,
-		].join("&");
-
-		const res = http.post(
-			`${BASE}/wp-admin/admin-ajax.php`,
-			body,
-			{
-				headers: HEADERS_ATC,
-				timeout: "60s",
-				tags: { endpoint: "add_to_cart" },
-			}
-		);
-
-		let ok = res.status && res.status < 400;
-		let j;
-		try {
-			j = res.json();
-			if (j && typeof j === "object") {
-				console.log(`[ATC JSON] keys=${Object.keys(j).join(",")}`);
-			}
-			ok =
-				ok &&
-				(j?.error === false || j?.fragments || j?.success === true);
-		} catch (e) {
-			console.log(`[ATC JSON parse error] ${String(e)}`);
-		}
-
-		if (!ok) {
-			console.log(
-				`[ATC BODY SNIPPET] ${String(res.body || "").slice(0, 300)}`
-			);
-		}
-
-		check(res, { "Add to Cart": () => ok }, { endpoint: "add_to_cart" });
-
-		sleep(1);
-	});
-
-	// 3) Checkout
-	group("Checkout", () => {
-		const HEADERS_FORM = {
-			Accept: "application/json, text/javascript, */*; q=0.01",
-			"Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-			"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-			"X-Requested-With": "XMLHttpRequest",
-			Origin: BASE,
-			Referer: `${BASE}/checkout/`,
-			"User-Agent": "k6-avotree-loadtest/1.0",
-			"X-Test-Run": "avotree-loadtest",
-		};
-
-		// 3.1 GET /checkout/
-		const page = http.get(`${BASE}/checkout/`, {
-			timeout: "60s",
-			tags: { endpoint: "checkout_page" },
-		});
-	  check(
-      page,
-      { "Checkout page OK": (r) => r.status && r.status < 400 },
-      { endpoint: "checkout_page" }
-    );
-
-		const $ = parseHTML(page.body);
-
-		// nonce cho checkout
-		let checkoutNonce =
-			$.find('input[name="woocommerce-process-checkout-nonce"]')
-				.first()
-				.attr("value") ||
-			$.find('input[name="_wpnonce"]').first().attr("value") ||
-			"";
-
-		// nonce cho update_order_review
-		let uorNonce = "";
-		{
-			const m =
-				page.body.match(
-					/update_order_review_nonce["']\s*:\s*["']([^"']+)["']/
-				) ||
-				page.body.match(/"update_order_review_nonce":"([a-zA-Z0-9]+)"/);
-			if (m) uorNonce = m[1];
-		}
-
-    check(
-      { checkoutNonce, uorNonce },
-      {
-        "Checkout nonce found": (v) => v.checkoutNonce && v.checkoutNonce.length > 0,
-        "UOR nonce found": (v) => v.uorNonce && v.uorNonce.length > 0,
-      },
-      { endpoint: "checkout_page" }
-    );
-
-		// 3.2 POST update_order_review
-		const email = `loadtest+${__VU}-${__ITER}@example.com`;
-		const postDataPairs = [
-			"wc-points-rewards-max-points=0",
-			"billing_first_name=Test",
-			"billing_last_name=User",
-			`billing_email=${encodeURIComponent(email)}`,
-			"billing_phone=0210000000",
-			"billing_country=NZ",
-			"billing_address_1=1 Test St",
-			"billing_city=Auckland",
-			"billing_postcode=1010",
-			"payment_method=cod",
-		];
-		const post_data = postDataPairs.join("&");
-
-		const uorBody = [
-			`security=${encodeURIComponent(uorNonce)}`,
-			`payment_method=cod`,
-			`country=NZ`,
-			`state=`,
-			`postcode=1010`,
-			`city=Auckland`,
-			`address=${encodeURIComponent("1 Test St")}`,
-			`address_2=`,
-			`s_country=NZ`,
-			`s_state=`,
-			`s_postcode=`,
-			`s_city=`,
-			`s_address=`,
-			`s_address_2=`,
-			`has_full_address=true`,
-			`post_data=${post_data}`,
-		].join("&");
-
-		const uor = http.post(`${BASE}/?wc-ajax=update_order_review`, uorBody, {
-			headers: HEADERS_FORM,
-			timeout: "60s",
-			tags: { endpoint: "update_order_review" },
-		});
-
-	  check(
-      uor,
-      { "UOR 200": (r) => r.status >= 200 && r.status < 400 },
-      { endpoint: "update_order_review" }
-    );
-
-		// 3.3 POST checkout
-		const form = [
-			`billing_first_name=Test`,
-			`billing_last_name=User`,
-			`billing_email=${encodeURIComponent(email)}`,
-			`billing_phone=0210000000`,
-			`billing_address_1=1 Test St`,
-			`billing_city=Auckland`,
-			`billing_postcode=1010`,
-			`billing_country=NZ`,
-			`payment_method=cod`,
-			`terms=on`,
-			`woocommerce-process-checkout-nonce=${encodeURIComponent(
-				checkoutNonce
-			)}`,
-			`_wp_http_referer=%2F%3Fwc-ajax%3Dupdate_order_review`,
-		].join("&");
-
-    const co = http.post(`${BASE}/?wc-ajax=checkout`, form, {
-      headers: HEADERS_FORM,
-      timeout: "60s",
-      tags: { endpoint: "checkout_finish" },
-    });
-  
-    let coOk = co.status && co.status < 400;
-    if (!coOk) {
-      console.log(`[Checkout BODY SNIPPET] ${String(co.body || "").slice(0, 300)}`);
-    }
-  
-    check(co, { "Checkout OK": () => coOk }, { endpoint: "checkout_finish" });
-
-	});
-
-	sleep(1 + Math.random()); // 1–2s
+  hitHome();
+  hitShopAll();
+  hitPDP();
+  addToCart();
+  runCheckout();
+  sleep(1 + Math.random()); // 1–2s
 }
