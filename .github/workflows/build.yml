@@ -273,7 +273,7 @@ jobs:
       windows_binary_artifact_name: ${{ steps.assign-artifact-names.outputs.windows-binary-artifact-name }}
     steps:
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: binaries
           path: dist
@@ -314,7 +314,7 @@ jobs:
           signed-artifact-name: 'windows-binary-signed'
 
       - name: Download signed Windows binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         if: needs.configure.outputs.sign_windows_artifacts == 'true'
         with:
           name: ${{ steps.sign-artifacts.outputs.artifact-name }}
@@ -371,7 +371,7 @@ jobs:
           Expand-Archive -Path .\wix311-binaries.zip -DestinationPath .\wix311\
           echo "$pwd\wix311" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Download Windows binary
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ${{ needs.sign-binaries.outputs.windows_binary_artifact_name }}
           path: packaging
@@ -418,7 +418,7 @@ jobs:
     needs: [configure, package]
     steps:
       - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         if: needs.configure.outputs.sign_windows_artifacts == 'true'
         with:
           name: binaries-windows
@@ -469,12 +469,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Download binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ${{ needs.sign-binaries.outputs.binary_artifact_name }}
           path: dist
       - name: Download Windows binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ${{ needs.sign-packages.outputs.artifact_name }}
           path: dist
@@ -515,12 +515,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Download binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ${{ needs.sign-binaries.outputs.binary_artifact_name }}
           path: dist
       - name: Download Windows binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ${{ needs.sign-packages.outputs.artifact_name }}
           path: dist
